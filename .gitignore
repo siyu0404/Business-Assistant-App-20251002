@@ -1,0 +1,10 @@
+# 虛擬環境
+venv/
+
+# Python 快取檔案
+__pycache__/
+*.pyc
+
+# ‼️ 極度重要的個人憑證！絕對不能上傳！
+credentials.json
+token.json
