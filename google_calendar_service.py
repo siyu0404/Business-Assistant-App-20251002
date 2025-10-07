@@ -1,7 +1,11 @@
-# google_calendar_service.py (修正路徑問題)
+# google_calendar_service.py (v2 - 智慧掃描版)
 
 import os
 import datetime as dt
+import base64
+import email
+import re # <-- 【新增】匯入正規表示式工具
+from email.header import decode_header, make_header # <-- 【新增】匯入標頭解碼工具
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -9,92 +13,94 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# --- 【新增】自動計算絕對路徑 ---
-# 獲取這個 .py 檔案所在的資料夾的絕對路徑
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/gmail.readonly"
+]
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-# 組合出 credentials.json 和 token.json 的絕對路徑
 CREDENTIALS_PATH = os.path.join(SCRIPT_DIR, 'credentials.json')
 TOKEN_PATH = os.path.join(SCRIPT_DIR, 'token.json')
-# --------------------------------
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
-def get_calendar_service():
+def get_google_credentials():
+    # (此函式不變)
     creds = None
-    # 【修改】使用絕對路徑來讀取 token.json
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # 【修改】使用絕對路徑來讀取 credentials.json
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
-        
-        # 【修改】使用絕對路徑來寫入 token.json
         with open(TOKEN_PATH, "w") as token:
             token.write(creds.to_json())
-    
-    try:
-        service = build("calendar", "v3", credentials=creds)
-        return service
-    except HttpError as error:
-        print(f"建立 service 時發生錯誤: {error}")
-        return None
+    return creds
 
 def create_google_meet_event(service, summary, start_time, end_time, attendees=None, description=""):
-        """
-        在 Google 日曆上建立一個新的活動，並自動生成 Google Meet 連結。
-        【修改】現在可以接收與會者 email 列表和會議說明。
-        """
-        if attendees is None:
-            attendees = []
+    # (此函式不變)
+    if attendees is None: attendees = []
+    event = {
+        "summary": summary, "description": description,
+        "start": {"dateTime": start_time.isoformat(), "timeZone": "Asia/Taipei"},
+        "end": {"dateTime": end_time.isoformat(), "timeZone": "Asia/Taipei"},
+        "attendees": [{"email": email} for email in attendees],
+        "conferenceData": {"createRequest": {"requestId": f"meet-{dt.datetime.now().timestamp()}", "conferenceSolutionKey": {"type": "hangoutsMeet"}}},
+        "reminders": {"useDefault": True},
+    }
+    try:
+        created_event = service.events().insert(calendarId="primary", body=event, conferenceDataVersion=1, sendUpdates="all").execute()
+        return created_event.get("hangoutLink")
+    except HttpError as error:
+        print(f"建立活動時發生錯誤: {error}"); return None
 
-        event = {
-            "summary": summary,
-            "description": description, # <-- 【新增】將傳入的 description 加到活動中
-            "start": {
-                "dateTime": start_time.isoformat(),
-                "timeZone": "Asia/Taipei",
-            },
-            "end": {
-                "dateTime": end_time.isoformat(),
-                "timeZone": "Asia/Taipei",
-            },
-            "attendees": [{"email": email} for email in attendees],
-            "conferenceData": {
-                "createRequest": {
-                    "requestId": f"meet-{dt.datetime.now().timestamp()}",
-                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
-                }
-            },
-            "reminders": {
-                "useDefault": True,
-            },
-        }
+# --- 【重大升級】scan_potential_meeting_emails 函式 ---
+def scan_potential_meeting_emails(creds):
+    try:
+        gmail_service = build("gmail", "v1", credentials=creds)
+        query = 'in:inbox is:unread ("約個時間" OR "開會" OR "會議" OR "討論一下")'
+        results = gmail_service.users().messages().list(userId="me", q=query, maxResults=30).execute()
+        messages = results.get("messages", [])
 
-        try:
-            created_event = service.events().insert(
-                calendarId="primary", 
-                body=event,
-                conferenceDataVersion=1,
-                sendUpdates="all" 
-            ).execute()
+        if not messages: return []
+        
+        potential_meetings = []
+        for message in messages:
+            msg = gmail_service.users().messages().get(userId="me", id=message["id"], format="raw").execute()
+            raw_email = base64.urlsafe_b64decode(msg["raw"].encode("ASCII"))
+            email_message = email.message_from_bytes(raw_email)
             
-            meet_link = created_event.get("hangoutLink")
-            print(f"✅ 活動建立成功！會議連結: {meet_link}")
-            return meet_link
-        except HttpError as error:
-            print(f"建立活動時發生錯誤: {error}")
-            return None
-if __name__ == "__main__":
-    print("--- 開始測試 Google Calendar API 功能 ---")
-    service = get_calendar_service()
-    if service:
-        now = dt.datetime.now(dt.timezone.utc)
-        start = now + dt.timedelta(hours=1)
-        end = start + dt.timedelta(hours=1)
-        create_google_meet_event(service, "Python 自動化測試會議", start, end)
-    print("--- 測試結束 ---")
+            # 【修正亂碼】使用 decode_header 來正確解碼標題
+            subject_header = email_message.get("Subject", "無標題")
+            decoded_subject = decode_header(subject_header)
+            subject = str(make_header(decoded_subject))
+
+            sender_header = email_message.get("From", "未知寄件人")
+            decoded_sender = decode_header(sender_header)
+            sender = str(make_header(decoded_sender))
+            
+            # 【新增功能】解析郵件內文並尋找連結
+            body = ""
+            if email_message.is_multipart():
+                for part in email_message.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
+                        break
+            else:
+                body = email_message.get_payload(decode=True).decode(email_message.get_content_charset() or 'utf-8', errors='ignore')
+
+            # 使用正規表示式尋找 http, https, meet.google.com, zoom.us 的連結
+            link_pattern = r'https?://[\w\./-]*'
+            found_link_match = re.search(link_pattern, body)
+            found_link = found_link_match.group(0) if found_link_match else ""
+
+            potential_meetings.append({
+                "subject": subject,
+                "sender": sender,
+                "snippet": msg.get("snippet", ""),
+                "link": found_link # <-- 把找到的連結也加進去
+            })
+        
+        return potential_meetings
+
+    except HttpError as error:
+        print(f"掃描郵件時發生錯誤: {error}"); return []
